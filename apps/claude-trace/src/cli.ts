@@ -4,6 +4,7 @@ import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import { HTMLGenerator } from "./html-generator";
+import { ReverseProxyServer } from "./reverse-proxy";
 
 // Colors for output
 export const colors = {
@@ -34,6 +35,7 @@ ${colors.yellow}OPTIONS:${colors.reset}
   --index           Generate conversation summaries and index for .claude-trace/ directory
   --run-with         Pass all following arguments to Claude process
   --include-all-requests Include all requests made through fetch, otherwise only requests to v1/messages with more than 2 messages in the context
+  --include-sensitive-headers Log sensitive headers (auth tokens, cookies) without redaction
   --no-open          Don't open generated HTML file in browser
   --log              Specify custom log file base name (without extension)
   --claude-path      Specify custom path to Claude binary
@@ -227,6 +229,184 @@ function getLoaderPath(): string {
 	return loaderPath;
 }
 
+// Magic bytes for detecting native binaries
+const NATIVE_BINARY_SIGNATURES = {
+	ELF: Buffer.from([0x7f, 0x45, 0x4c, 0x46]), // Linux ELF
+	MACHO_32: Buffer.from([0xfe, 0xed, 0xfa, 0xce]), // macOS Mach-O 32-bit
+	MACHO_64: Buffer.from([0xfe, 0xed, 0xfa, 0xcf]), // macOS Mach-O 64-bit
+	MACHO_32_REV: Buffer.from([0xce, 0xfa, 0xed, 0xfe]), // macOS Mach-O 32-bit (reverse)
+	MACHO_64_REV: Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), // macOS Mach-O 64-bit (reverse)
+	MACHO_FAT: Buffer.from([0xca, 0xfe, 0xba, 0xbe]), // macOS Mach-O fat binary
+	PE: Buffer.from([0x4d, 0x5a]), // Windows PE (MZ header)
+};
+
+function isNativeBinary(filePath: string): boolean {
+	try {
+		const fd = fs.openSync(filePath, "r");
+		const buffer = Buffer.alloc(4);
+		fs.readSync(fd, buffer, 0, 4, 0);
+		fs.closeSync(fd);
+
+		// Check for ELF (Linux)
+		if (buffer.subarray(0, 4).equals(NATIVE_BINARY_SIGNATURES.ELF)) {
+			return true;
+		}
+
+		// Check for Mach-O (macOS)
+		if (
+			buffer.subarray(0, 4).equals(NATIVE_BINARY_SIGNATURES.MACHO_32) ||
+			buffer.subarray(0, 4).equals(NATIVE_BINARY_SIGNATURES.MACHO_64) ||
+			buffer.subarray(0, 4).equals(NATIVE_BINARY_SIGNATURES.MACHO_32_REV) ||
+			buffer.subarray(0, 4).equals(NATIVE_BINARY_SIGNATURES.MACHO_64_REV) ||
+			buffer.subarray(0, 4).equals(NATIVE_BINARY_SIGNATURES.MACHO_FAT)
+		) {
+			return true;
+		}
+
+		// Check for PE (Windows)
+		if (buffer.subarray(0, 2).equals(NATIVE_BINARY_SIGNATURES.PE)) {
+			return true;
+		}
+
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+function getClaudeBinaryPath(customPath?: string): string {
+	// If custom path is provided, use it directly
+	if (customPath) {
+		if (!fs.existsSync(customPath)) {
+			log(`Claude binary not found at specified path: ${customPath}`, "red");
+			process.exit(1);
+		}
+		return fs.realpathSync(customPath);
+	}
+
+	try {
+		let claudePath = require("child_process")
+			.execSync("which claude", {
+				encoding: "utf-8",
+			})
+			.trim();
+
+		// Handle shell aliases
+		const aliasMatch = claudePath.match(/:\s*aliased to\s+(.+)$/);
+		if (aliasMatch && aliasMatch[1]) {
+			claudePath = aliasMatch[1];
+		}
+
+		// Resolve symlinks
+		return fs.realpathSync(claudePath);
+	} catch {
+		// Check common locations
+		const os = require("os");
+		const possiblePaths = [
+			path.join(os.homedir(), ".local", "bin", "claude"),
+			path.join(os.homedir(), ".claude", "local", "claude"),
+			"/usr/local/bin/claude",
+			"/usr/bin/claude",
+		];
+
+		for (const p of possiblePaths) {
+			if (fs.existsSync(p)) {
+				return fs.realpathSync(p);
+			}
+		}
+
+		log(`Claude CLI not found in PATH or common locations`, "red");
+		log(`Please install Claude Code CLI first`, "red");
+		process.exit(1);
+	}
+}
+
+// Run Claude as a native binary with reverse proxy interception
+async function runClaudeNativeWithProxy(
+	claudePath: string,
+	claudeArgs: string[] = [],
+	includeAllRequests: boolean = false,
+	openInBrowser: boolean = false,
+	logBaseName?: string,
+	logSensitiveHeaders: boolean = false,
+): Promise<void> {
+	log("Using reverse proxy mode for native binary", "yellow");
+	console.log("");
+
+	// Start the reverse proxy
+	const proxy = new ReverseProxyServer({
+		logBaseName: logBaseName,
+		includeAllRequests: includeAllRequests,
+		openBrowser: openInBrowser,
+		logSensitiveHeaders: logSensitiveHeaders,
+	});
+
+	let proxyInfo: { port: number; url: string };
+	try {
+		proxyInfo = await proxy.start();
+		log(`Reverse proxy started at ${proxyInfo.url}`, "green");
+		console.log("");
+	} catch (error) {
+		const err = error as Error;
+		log(`Failed to start reverse proxy: ${err.message}`, "red");
+		process.exit(1);
+	}
+
+	// Spawn Claude with ANTHROPIC_BASE_URL pointing to our HTTP proxy
+	// Using HTTP avoids TLS certificate issues with Bun binaries
+	const child: ChildProcess = spawn(claudePath, claudeArgs, {
+		env: {
+			...process.env,
+			ANTHROPIC_BASE_URL: proxyInfo.url,
+		},
+		stdio: "inherit",
+		cwd: process.cwd(),
+	});
+
+	// Handle child process events
+	child.on("error", (error: Error) => {
+		proxy.stop();
+		log(`Error starting Claude: ${error.message}`, "red");
+		process.exit(1);
+	});
+
+	child.on("exit", (code: number | null, signal: string | null) => {
+		proxy.stop();
+		if (signal) {
+			log(`\nClaude terminated by signal: ${signal}`, "yellow");
+		} else if (code !== 0 && code !== null) {
+			log(`\nClaude exited with code: ${code}`, "yellow");
+		} else {
+			log("\nClaude session completed", "green");
+		}
+	});
+
+	// Handle our own signals
+	const handleSignal = (signal: string) => {
+		log(`\nReceived ${signal}, shutting down...`, "yellow");
+		proxy.stop();
+		if (child.pid) {
+			child.kill(signal as NodeJS.Signals);
+		}
+	};
+
+	process.on("SIGINT", () => handleSignal("SIGINT"));
+	process.on("SIGTERM", () => handleSignal("SIGTERM"));
+
+	// Wait for child process to complete
+	try {
+		await new Promise<void>((resolve, reject) => {
+			child.on("exit", () => resolve());
+			child.on("error", reject);
+		});
+	} catch (error) {
+		const err = error as Error;
+		proxy.stop();
+		log(`Unexpected error: ${err.message}`, "red");
+		process.exit(1);
+	}
+}
+
 // Scenario 1: No args -> launch node with interceptor and absolute path to claude
 async function runClaudeWithInterception(
 	claudeArgs: string[] = [],
@@ -234,6 +414,7 @@ async function runClaudeWithInterception(
 	openInBrowser: boolean = false,
 	customClaudePath?: string,
 	logBaseName?: string,
+	logSensitiveHeaders: boolean = false,
 ): Promise<void> {
 	log("Claude Trace", "blue");
 	log("Starting Claude with traffic logging", "yellow");
@@ -242,15 +423,27 @@ async function runClaudeWithInterception(
 	}
 	console.log("");
 
-	const claudePath = getClaudeAbsolutePath(customClaudePath);
+	// Get the binary path and check if it's a native binary
+	const claudePath = getClaudeBinaryPath(customClaudePath);
+	log(`Using Claude binary: ${claudePath}`, "blue");
+
+	// Check if this is a native binary (ELF, Mach-O, PE)
+	if (isNativeBinary(claudePath)) {
+		log("Detected native binary", "yellow");
+		await runClaudeNativeWithProxy(claudePath, claudeArgs, includeAllRequests, openInBrowser, logBaseName, logSensitiveHeaders);
+		return;
+	}
+
+	// For Node.js-based Claude, use the original interceptor approach
+	const jsPath = resolveToJsFile(claudePath);
 	const loaderPath = getLoaderPath();
 
-	log(`Using Claude binary: ${claudePath}`, "blue");
+	log(`Using JavaScript entry: ${jsPath}`, "blue");
 	log("Starting traffic logger...", "green");
 	console.log("");
 
 	// Launch node with interceptor and absolute path to claude, plus any additional arguments
-	const spawnArgs = ["--require", loaderPath, claudePath, ...claudeArgs];
+	const spawnArgs = ["--require", loaderPath, jsPath, ...claudeArgs];
 	const child: ChildProcess = spawn("node", spawnArgs, {
 		env: {
 			...process.env,
@@ -487,6 +680,9 @@ async function main(): Promise<void> {
 		logBaseName = claudeTraceArgs[logIndex + 1];
 	}
 
+	// Check for sensitive headers logging flag
+	const logSensitiveHeaders = claudeTraceArgs.includes("--include-sensitive-headers");
+
 	// Scenario 2: --extract-token
 	if (claudeTraceArgs.includes("--extract-token")) {
 		await extractToken(customClaudePath);
@@ -525,7 +721,7 @@ async function main(): Promise<void> {
 	}
 
 	// Scenario 1: No args (or claude with args) -> launch claude with interception
-	await runClaudeWithInterception(claudeArgs, includeAllRequests, openInBrowser, customClaudePath, logBaseName);
+	await runClaudeWithInterception(claudeArgs, includeAllRequests, openInBrowser, customClaudePath, logBaseName, logSensitiveHeaders);
 }
 
 main().catch((error) => {
