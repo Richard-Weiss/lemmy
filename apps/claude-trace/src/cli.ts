@@ -152,22 +152,53 @@ function resolveToJsFile(filePath: string): string {
 	}
 }
 
+// Resolve bash wrappers and return JS entry point (for Node interceptor)
 function getClaudeAbsolutePath(customPath?: string): string {
-	// If custom path is provided, use it directly
+	const claudePath = findClaudePath(customPath);
+	const isWindows = process.platform === "win32";
+
+	// Check if the path is a bash wrapper (Unix only)
+	if (!isWindows && fs.existsSync(claudePath)) {
+		const content = fs.readFileSync(claudePath, "utf-8");
+		if (content.startsWith("#!/bin/bash")) {
+			const execMatch = content.match(/exec\s+"([^"]+)"/);
+			if (execMatch && execMatch[1]) {
+				return resolveToJsFile(execMatch[1]);
+			}
+		}
+	}
+
+	return resolveToJsFile(claudePath);
+}
+
+// Get raw binary path (for native binary detection)
+function getClaudeBinaryPath(customPath?: string): string {
+	return fs.realpathSync(findClaudePath(customPath));
+}
+
+// Shared logic to find Claude binary path
+function findClaudePath(customPath?: string): string {
 	if (customPath) {
 		if (!fs.existsSync(customPath)) {
 			log(`Claude binary not found at specified path: ${customPath}`, "red");
 			process.exit(1);
 		}
-		return resolveToJsFile(customPath);
+		return customPath;
 	}
 
+	const os = require("os");
+	const isWindows = process.platform === "win32";
+
 	try {
+		const findCmd = isWindows ? "where claude" : "which claude";
 		let claudePath = require("child_process")
-			.execSync("which claude", {
-				encoding: "utf-8",
-			})
+			.execSync(findCmd, { encoding: "utf-8" })
 			.trim();
+
+		// Windows 'where' can return multiple lines, take the first
+		if (isWindows && claudePath.includes("\n")) {
+			claudePath = claudePath.split("\n")[0].trim();
+		}
 
 		// Handle shell aliases (e.g., "claude: aliased to /path/to/claude")
 		const aliasMatch = claudePath.match(/:\s*aliased to\s+(.+)$/);
@@ -175,44 +206,30 @@ function getClaudeAbsolutePath(customPath?: string): string {
 			claudePath = aliasMatch[1];
 		}
 
-		// Check if the path is a bash wrapper
-		if (fs.existsSync(claudePath)) {
-			const content = fs.readFileSync(claudePath, "utf-8");
-			if (content.startsWith("#!/bin/bash")) {
-				// Parse bash wrapper to find actual executable
-				const execMatch = content.match(/exec\s+"([^"]+)"/);
-				if (execMatch && execMatch[1]) {
-					const actualPath = execMatch[1];
-					// Resolve any symlinks to get the final JS file
-					return resolveToJsFile(actualPath);
-				}
+		return claudePath;
+	} catch {
+		// Check common installation locations
+		const possiblePaths = isWindows
+			? [
+				path.join(os.homedir(), ".local", "bin", "claude.exe"),
+				path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
+			]
+			: [
+				path.join(os.homedir(), ".claude", "bin", "claude"),
+				path.join(os.homedir(), ".claude", "local", "claude"),
+				path.join(os.homedir(), ".local", "bin", "claude"),
+				"/opt/homebrew/bin/claude",
+				"/usr/local/bin/claude",
+				"/usr/bin/claude",
+			];
+
+		for (const p of possiblePaths) {
+			if (fs.existsSync(p)) {
+				return p;
 			}
 		}
 
-		return resolveToJsFile(claudePath);
-	} catch (error) {
-		// First try the local bash wrapper
-		const os = require("os");
-		const localClaudeWrapper = path.join(os.homedir(), ".claude", "local", "claude");
-
-		if (fs.existsSync(localClaudeWrapper)) {
-			const content = fs.readFileSync(localClaudeWrapper, "utf-8");
-			if (content.startsWith("#!/bin/bash")) {
-				const execMatch = content.match(/exec\s+"([^"]+)"/);
-				if (execMatch && execMatch[1]) {
-					return resolveToJsFile(execMatch[1]);
-				}
-			}
-		}
-
-		// Then try the node_modules/.bin path
-		const localClaudePath = path.join(os.homedir(), ".claude", "local", "node_modules", ".bin", "claude");
-		if (fs.existsSync(localClaudePath)) {
-			return resolveToJsFile(localClaudePath);
-		}
-
-		log(`Claude CLI not found in PATH`, "red");
-		log(`Also checked for local installation at: ${localClaudeWrapper}`, "red");
+		log(`Claude CLI not found in PATH or common locations`, "red");
 		log(`Please install Claude Code CLI first`, "red");
 		process.exit(1);
 	}
@@ -271,53 +288,6 @@ function isNativeBinary(filePath: string): boolean {
 		return false;
 	} catch {
 		return false;
-	}
-}
-
-function getClaudeBinaryPath(customPath?: string): string {
-	// If custom path is provided, use it directly
-	if (customPath) {
-		if (!fs.existsSync(customPath)) {
-			log(`Claude binary not found at specified path: ${customPath}`, "red");
-			process.exit(1);
-		}
-		return fs.realpathSync(customPath);
-	}
-
-	try {
-		let claudePath = require("child_process")
-			.execSync("which claude", {
-				encoding: "utf-8",
-			})
-			.trim();
-
-		// Handle shell aliases
-		const aliasMatch = claudePath.match(/:\s*aliased to\s+(.+)$/);
-		if (aliasMatch && aliasMatch[1]) {
-			claudePath = aliasMatch[1];
-		}
-
-		// Resolve symlinks
-		return fs.realpathSync(claudePath);
-	} catch {
-		// Check common locations
-		const os = require("os");
-		const possiblePaths = [
-			path.join(os.homedir(), ".local", "bin", "claude"),
-			path.join(os.homedir(), ".claude", "local", "claude"),
-			"/usr/local/bin/claude",
-			"/usr/bin/claude",
-		];
-
-		for (const p of possiblePaths) {
-			if (fs.existsSync(p)) {
-				return fs.realpathSync(p);
-			}
-		}
-
-		log(`Claude CLI not found in PATH or common locations`, "red");
-		log(`Please install Claude Code CLI first`, "red");
-		process.exit(1);
 	}
 }
 
