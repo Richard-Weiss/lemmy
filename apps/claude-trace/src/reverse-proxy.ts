@@ -181,13 +181,6 @@ export class ReverseProxyServer {
 							parsedRequestBody = requestBody || null;
 						}
 
-						// Check message count filter (only log if > 2 messages)
-						if (!this.config.includeAllRequests && parsedRequestBody?.messages) {
-							if (parsedRequestBody.messages.length <= 2) {
-								return;
-							}
-						}
-
 						// Parse response body
 						let parsedResponseBody: { body?: any; body_raw?: string } = {};
 						const contentType = proxyRes.headers["content-type"] || "";
