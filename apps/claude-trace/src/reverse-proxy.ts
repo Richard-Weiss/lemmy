@@ -2,8 +2,10 @@ import * as https from "https";
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
-import { RawPair } from "./types";
+import * as zlib from "zlib";
+import { RawPair, SSEEvent } from "./types";
 import { HTMLGenerator } from "./html-generator";
+import { SharedConversationProcessor } from "./shared-conversation-processor";
 
 export interface ReverseProxyConfig {
 	port?: number;
@@ -82,6 +84,32 @@ export class ReverseProxyServer {
 		return result;
 	}
 
+	private parseSSEEvents(body: string): SSEEvent[] {
+		const events: SSEEvent[] = [];
+		const lines = body.split("\n");
+		let currentEvent = "";
+
+		for (const line of lines) {
+			if (line.startsWith("event: ")) {
+				currentEvent = line.substring(7).trim();
+			} else if (line.startsWith("data: ")) {
+				const data = line.substring(6).trim();
+				if (data === "[DONE]") break;
+				try {
+					const parsed = JSON.parse(data);
+					events.push({
+						event: currentEvent || parsed?.type || "unknown",
+						data: parsed,
+						timestamp: new Date().toISOString(),
+					});
+				} catch {
+					// Skip unparseable events
+				}
+			}
+		}
+		return events;
+	}
+
 	private async writePairToLog(pair: RawPair): Promise<void> {
 		try {
 			const jsonLine = JSON.stringify(pair) + "\n";
@@ -157,10 +185,10 @@ export class ReverseProxyServer {
 
 			const proxyReq = https.request(options, (proxyRes) => {
 				const responseTimestamp = Date.now();
-				let responseBody = "";
+				const responseChunks: Buffer[] = [];
 
 				proxyRes.on("data", (chunk) => {
-					responseBody += chunk;
+					responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 					res.write(chunk);
 				});
 
@@ -181,12 +209,39 @@ export class ReverseProxyServer {
 							parsedRequestBody = requestBody || null;
 						}
 
+						// Decompress response if gzipped
+						const rawBuffer = Buffer.concat(responseChunks);
+						let responseBody: string;
+						const contentEncoding = (proxyRes.headers["content-encoding"] || "").toLowerCase();
+						try {
+							if (contentEncoding === "gzip") {
+								responseBody = zlib.gunzipSync(rawBuffer).toString("utf-8");
+							} else if (contentEncoding === "br") {
+								responseBody = zlib.brotliDecompressSync(rawBuffer).toString("utf-8");
+							} else if (contentEncoding === "deflate") {
+								responseBody = zlib.inflateSync(rawBuffer).toString("utf-8");
+							} else {
+								responseBody = rawBuffer.toString("utf-8");
+							}
+						} catch {
+							responseBody = rawBuffer.toString("utf-8");
+						}
+
 						// Parse response body
-						let parsedResponseBody: { body?: any; body_raw?: string } = {};
+						let parsedResponseBody: { body?: any; body_raw?: string; events?: SSEEvent[] } = {};
 						const contentType = proxyRes.headers["content-type"] || "";
 						try {
 							if (contentType.includes("application/json")) {
 								parsedResponseBody = { body: JSON.parse(responseBody) };
+							} else if (contentType.includes("text/event-stream")) {
+								const events = this.parseSSEEvents(responseBody);
+								const processor = new SharedConversationProcessor();
+								try {
+									const message = processor.parseStreamingResponse(responseBody);
+									parsedResponseBody = { body: message, events };
+								} catch {
+									parsedResponseBody = { body_raw: responseBody, events };
+								}
 							} else {
 								parsedResponseBody = { body_raw: responseBody };
 							}
